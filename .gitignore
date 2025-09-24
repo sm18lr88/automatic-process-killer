@@ -1,3 +1,36 @@
-# Specify filepatterns you want git to ignore.
-*.rdbg
+# Build artifacts
+*.obj
+*.pdb
+*.idb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.exe
+*.res
+*.rsp
+*.tlog
+*.lastbuildstate
+*.cache
+*.log
 
+# VS / VSCode
+.vs/
+.ipch/
+*.VC.db
+*.opendb
+*.suo
+*.user
+*.VCXProj.*
+*.sln
+*.vcxproj
+.vscode/
+
+# CMake (if you add it later)
+CMakeFiles/
+CMakeCache.txt
+cmake-build-*/
+build/
+
+# Misc
+*.rdbg
