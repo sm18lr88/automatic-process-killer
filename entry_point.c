@@ -1,653 +1,623 @@
 /*
+  Win32 Process Killer
+  ---------------------------------------
+  • Fully Unicode (UTF‑16) code path
+  • Tray icon with NOTIFYICON_VERSION_4
+  • Single-instance via named mutex
+  • Wildcard support in blacklist (e.g., chrome*.exe) via PathMatchSpecW
+  • Case-insensitive matching; supports base name ("notepad.exe") or full paths
+  • Safer startup entry using HKCU\...\Run (RegGetValueW/RegSetValueExW)
+  • Uses QueryFullProcessImageNameW + PROCESS_QUERY_LIMITED_INFORMATION for names
+  • Optional restart-as-admin
+  • DPI awareness set to Per‑Monitor v2 where available (API fallback)
 
------------
-MIT License
------------
+  Notes:
+  • Some processes require elevation to terminate.
+  • By default, blacklist is stored next to the EXE if writable; otherwise in
+    %LOCALAPPDATA%\Win32ProcessKiller\blacklist.txt.
 
-Copyright (c) 2022 Delicious Lines
+  Build (MSVC):
+    cl /nologo /O2 /W4 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN entry_point.c ^
+       /link /SUBSYSTEM:WINDOWS
 
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"),
-to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-IN THE SOFTWARE.
-
+  (No external resources required; uses system icon.)
 */
 
-
-#include <stdint.h>
-#include <string.h>
-
-#define STB_SPRINTF_IMPLEMENTATION
-#include "stb_sprintf.h"
-
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+
 #include <windows.h>
-#include <psapi.h>    // For EnumProcesses().
-#include <shlwapi.h>  // For file path stuff.
-#include <shellapi.h> // For tray icon stuff.
+#include <shellapi.h>
+#include <shlwapi.h>
+#include <shlobj.h>      // SHGetKnownFolderPath
+#include <knownfolders.h>
+#include <strsafe.h>
+#include <psapi.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <wctype.h>
+#include <stdlib.h>
 
-#pragma comment(lib, "Kernel32")
-#pragma comment(lib, "User32")
-#pragma comment(lib, "Shlwapi")
-#pragma comment(lib, "Shell32")
-#pragma comment(lib, "Advapi32") // Required for registry stuff.
+#pragma comment(lib, "User32.lib")
+#pragma comment(lib, "Shell32.lib")
+#pragma comment(lib, "Shlwapi.lib")
+#pragma comment(lib, "Advapi32.lib")
+#pragma comment(lib, "Psapi.lib")
+#pragma comment(lib, "Ole32.lib") // CoTaskMemFree for SHGetKnownFolderPath
 
+// ---------------------------------------------------------------------------------------------------------------------
+// App constants
 
-#define true  1
-#define false 0
+#define APP_WINDOW_CLASS L"Win32ProcessKillerHiddenWindow"
+#define APP_TITLE        L"Win32 Process Killer"
+#define APP_TIP          L"Process Killer"
+#define RUN_KEY_PATH     L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+#define RUN_VALUE_NAME   L"win32_process_killer"  // preserved for compatibility
+#define BLACKLIST_NAME   L"blacklist.txt"
 
-typedef uint8_t  b8;
+#define TRAY_MSG   (WM_APP + 1)
 
-typedef uint8_t  u8;
-typedef uint16_t u16;
-typedef uint32_t u32;
-typedef uint64_t u64;
+enum MENU_IDS {
+    MENU_ID_RUN_AT_STARTUP = 1001,
+    MENU_ID_STOP_AT_STARTUP,
+    MENU_ID_OPEN_BLACKLIST,
+    MENU_ID_CREATE_BLACKLIST,
+    MENU_ID_RELOAD_NOW,
+    MENU_ID_RESTART_ADMIN,
+    MENU_ID_EXIT
+};
 
-typedef int8_t   s8;
-typedef int16_t  s16;
-typedef int32_t  s32;
-typedef int64_t  s64;
+// Fixed GUID for tray icon (prevents spoofing and ensures stable identity)
+static const GUID kTrayGuid = {0x4e7596f4, 0x1b35, 0x4e8e, {0x91,0x2a,0xd9,0x8e,0x72,0x6d,0x1b,0x73}};
 
-#define cast(_x, _type) ((_type)(_x))
+// ---------------------------------------------------------------------------------------------------------------------
+// Small helpers
 
-#define KB(_x) ((_x)   * 1024)
-#define MB(_x) (KB(_x) * 1024)
+static inline void SafeFree(void* p) { if (p) free(p); }
 
-typedef struct
-{
-    void* data;
-    u64 size;
-} Memory;
-
-typedef struct
-{
-    char* data;
-    s32 count;
-} String;
-
-#define STRING(_v) {.data = _v, .count = sizeof(_v) - 1}
-
-
-// Globals. START
-const u64 TMP_MEMORY_SIZE = MB(10);
-Memory tmp_memory = {};
-u64 tmp_memory_offset = 0;
-
-Memory blacklist_memory = {};
-String blacklist = {};
-u64 blacklist_last_modified = 0;
-
-const u32 WM_INTERACT_WITH_TRAY_ICON = WM_USER;
-
-const String REGISTRY_KEY_PATH = STRING("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-const String REGISTRY_KEY_NAME = STRING("win32_process_killer");
-const u16*   REGISTRY_KEY_NAME_UTF16 = L"win32_process_killer";
-
-const String LIST_NAME = STRING("blacklist.txt");
-
-const u8 SHOULD_RUN = 0x01;
-u8 global_flags = SHOULD_RUN;
-// Globals. END
-
-
-inline String String_(char* c_string)
-{
-    String string = {.data = c_string, .count = strlen(c_string)};
-    return string;
-}
-
-inline Memory reallocate(Memory data, u64 new_size)
-{
-    if(data.size >= new_size) return data;
-    
-    if(data.data) VirtualFree(data.data, 0, MEM_RELEASE);
-    
-    data.size = new_size;
-    data.data = VirtualAlloc(NULL, new_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    
-    return data;
-}
-
-inline void* tallocate(u64 size)
-{
-    void* data = tmp_memory.data + tmp_memory_offset;
-    tmp_memory_offset += size;
-    
-    return data;
-}
-
-inline void treset()
-{
-    tmp_memory_offset = 0;
-}
-
-inline b8 strings_match(String* a, String* b)
-{
-    if(a->count != b->count) return false;
-    return (memcmp(a->data, b->data, a->count) == 0);
-}
-
-String utf16_to_utf8(u16* input, u32 num_characters_in_input)
-{
-    u32 output_size = num_characters_in_input * 4 + 1; // '+ 1' to easily convert to a C string.
-    
-    u8* output = tallocate(output_size);
-    String result = {.data = cast(output, char*)};
-    memset(result.data, 0, output_size);
-    
-    u32 num_utf16_characters_decoded_so_far = 0;
-    while(num_utf16_characters_decoded_so_far < num_characters_in_input)
-    {
-        u32 codepoint = 0;
-        u16 value = *input;
-        
-        // Retrieve codepoint. START
-        if(value < 0xd800 || (value >= 0xe000 && value <= 0xffFF))
-        {
-            codepoint = value;
-            input++;
-        }
-        else
-        {
-            u16 leading_surrogate  = input[0];
-            u16 trailing_surrogate = input[1];
-            
-            if((leading_surrogate & 0b1111110000000000) == 0b1101100000000000 && (trailing_surrogate & 0b1111110000000000) == 0b1101110000000000)
-            {
-                codepoint = (cast(leading_surrogate - 0xd800, u32) << 10) | (trailing_surrogate - 0xdc00);
-                input += 2;
-            }
-            else input++;
-        }
-        // Retrieve codepoint. END
-        
-        // Convert codepoint to UTF-8. START
-        if(codepoint < 0x80)
-        {
-            output[0] = codepoint;
-            output++;
-            result.count++;
-        }
-        else if(codepoint < 0x800)
-        {
-            output[0] = 0b11000000 | (codepoint >> 6);
-            output[1] = 0b10000000 | (codepoint & 0b111111);
-            
-            output       += 2;
-            result.count += 2;
-        }
-        else if(codepoint < 0x10000)
-        {
-            output[0] = 0b11100000 | (codepoint >> 12);
-            output[1] = 0b10000000 | ((codepoint >> 6) & 0b111111);
-            output[2] = 0b10000000 | (codepoint & 0b111111);
-            
-            output       += 3;
-            result.count += 3;
-        }
-        else
-        {
-            output[0] = 0b11110000 | (codepoint >> 18);
-            output[1] = 0b10000000 | ((codepoint >> 12) & 0b111111);
-            output[2] = 0b10000000 | ((codepoint >> 6) & 0b111111);
-            output[3] = 0b10000000 | (codepoint & 0b111111);
-            
-            output       += 4;
-            result.count += 4;
-        }
-        // Convert codepoint to UTF-8. END
-        
-        num_utf16_characters_decoded_so_far++;
+static BOOL IsRunningAsAdmin(void) {
+    BOOL is_admin = FALSE;
+    HANDLE token = NULL;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        TOKEN_ELEVATION elev = {0};
+        DWORD cb = sizeof(elev);
+        if (GetTokenInformation(token, TokenElevation, &elev, cb, &cb))
+            is_admin = elev.TokenIsElevated;
+        CloseHandle(token);
     }
-    
-    return result;
+    return is_admin;
 }
 
-u16* utf8_to_utf16(String utf8)
-{
-    u64 result_size = utf8.count * sizeof(u16) * 2 + 2;
-    u16* result = tallocate(result_size);
-    memset(result, 0, result_size);
-    
-    u16* output = result;
-    
-    char* input = utf8.data;
-    char* limit = utf8.data + utf8.count;
-    
-    while(input < limit)
-    {
-        u32 codepoint = 0;
-        
-        // Retrieve codepoint. START
-        if((input[0] & 0b10000000) == 0)
-        {
-            codepoint = input[0];
-            input++;
-        }
-        else if((input[0] & 0b11100000) == 0b11000000)
-        {
-            codepoint = (cast(input[0] & 0b11111, u32) << 6) | (input[1] & 0b111111);
-            input += 2;
-        }
-        else if((input[0] & 0b11110000) == 0b11100000)
-        {
-            codepoint = (cast(input[0] & 0b1111, u32) << 12) | (cast(input[1] & 0b111111, u32) << 6) | (input[2] & 0b111111);
-            input += 3;
-        }
-        else
-        {
-            codepoint = (cast(input[0] & 0b11111, u32) << 18) | (cast(input[1] & 0b111111, u32) << 12) | (cast(input[2] & 0b111111, u32) << 6) | (input[3] & 0b111111);
-            input += 4;
-        }
-        // Retrieve codepoint. END
-        
-        // Convert codepoint to UTF-16. START
-        if(codepoint < 0xd800 || (codepoint >= 0xe000 && codepoint <= 0xffFF))
-        {
-            *output = codepoint;
-            output++;
-        }
-        else
-        {
-            codepoint -= 0x10000;
-            
-            output[0] = (codepoint >> 10) + 0xd800;
-            output[1] = (codepoint & 0b1111111111) + 0xdc00;
-            output += 2;
-        }
-        // Convert codepoint to UTF-16. END
-    }
-    
-    return result;
-}
-
-inline u16* get_full_exe_filepath_utf16(u32* num_characters_in_filepath)
-{
-    const u32 MAX_CHARACTERS_IN_FILEPATH = 2048;
-    u16* utf16_filepath = tallocate((MAX_CHARACTERS_IN_FILEPATH + 1) * sizeof(u16) * 2);
-    
-    u32 num_characters = GetModuleFileNameW(NULL, utf16_filepath, MAX_CHARACTERS_IN_FILEPATH);
-    if(num_characters_in_filepath) *num_characters_in_filepath = num_characters;
-    
-    return utf16_filepath;
-}
-
-String get_exe_filepath()
-{
-    u32 num_characters_in_filepath = 0;
-    u16* utf16_filepath = get_full_exe_filepath_utf16(&num_characters_in_filepath);
-    PathRemoveFileSpecW(utf16_filepath);
-    
-    num_characters_in_filepath = wcslen(utf16_filepath);
-    
-    String filepath = utf16_to_utf8(utf16_filepath, num_characters_in_filepath);
-    return filepath;
-}
-
-inline String get_full_exe_filepath()
-{
-    u32 num_characters_in_filepath = 0;
-    u16* utf16_filepath = get_full_exe_filepath_utf16(&num_characters_in_filepath);
-    
-    String filepath = utf16_to_utf8(utf16_filepath, num_characters_in_filepath);
-    return filepath;
-}
-
-void maybe_load_blacklist()
-{
-    /////////////////////////////////////////////////////////////////////////////////////////////
-    // NOTE: we only load the blacklist if it has been modified since the last time we loaded it.
-    /////////////////////////////////////////////////////////////////////////////////////////////
-
-    // Get the black list filepath. START
-    String exe_filepath = get_exe_filepath();
-    
-    String filepath = {.data = tallocate(exe_filepath.count + LIST_NAME.count + 8)};
-    stbsp_sprintf(filepath.data, "%s/%s", exe_filepath.data, LIST_NAME.data);
-    filepath.count = strlen(filepath.data);
-    
-    u16* utf16_filepath = utf8_to_utf16(filepath);
-    // Get the black list filepath. END
-    
-    
-    void* file = CreateFileW(utf16_filepath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if(file != INVALID_HANDLE_VALUE)
-    {
-        u64 file_last_modified = 0;
-        GetFileTime(file, NULL, NULL, cast(&file_last_modified, FILETIME*));
-    
-        u64 file_size = 0;
-        GetFileSizeEx(file, cast(&file_size, LARGE_INTEGER*));
-        
-        
-        if(file_last_modified != blacklist_last_modified || blacklist.count != file_size)
-        { // The list has been modified since last time we loaded it, we need to reload it.
-            blacklist_memory = reallocate(blacklist_memory, file_size);
-            blacklist.data = blacklist_memory.data;
-            
-            unsigned long num_bytes_read;
-            ReadFile(file, blacklist.data, file_size, &num_bytes_read, NULL);
-            blacklist.count = num_bytes_read;
-            
-            blacklist_last_modified = file_last_modified;
-        }
-        
-        
-        CloseHandle(file);
-    }
-}
-
-b8 do_we_run_at_startup()
-{
-    HKEY key = NULL;
-    LSTATUS status = RegCreateKeyExA(HKEY_CURRENT_USER, REGISTRY_KEY_PATH.data, 0, NULL, REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, NULL, &key, NULL);
-    if(status != ERROR_SUCCESS) return false;
-    
-    const u32 VALUE_NAME_MAX_SIZE = 256  * sizeof(u16);
-    const u32 VALUE_DATA_MAX_SIZE = 2048 * sizeof(u16);
-    
-    u8 value_name[VALUE_NAME_MAX_SIZE];
-    u8 value_data[VALUE_DATA_MAX_SIZE];
-    
-    u32 index = 0;
-    while(1)
-    {
-        DWORD name_buffer_size = VALUE_NAME_MAX_SIZE;
-        DWORD data_buffer_size = VALUE_DATA_MAX_SIZE;
-        status = RegEnumValueW(key, index, cast(value_name, u16*), &name_buffer_size, NULL, NULL, value_data, &data_buffer_size);
-        index++;
-        
-        if(status == ERROR_NO_MORE_ITEMS) break;
-        else if(status != ERROR_SUCCESS) continue;
-        
-        s32 num_characters_in_utf16_name = wcslen(cast(value_name, u16*));
-        String name = utf16_to_utf8(cast(value_name, u16*), num_characters_in_utf16_name);
-        
-        if(strings_match(cast(&REGISTRY_KEY_NAME, String*), &name))
-        {
-            /////////////////////////////////////////////////////////////////////////////
-            // NOTE: if the key data does not match the executable filepath we delete it.
-            /////////////////////////////////////////////////////////////////////////////
-        
-            s32 num_characters_in_utf16_filepath = wcslen(cast(value_data, u16*));
-            String filepath = utf16_to_utf8(cast(value_data, u16*), num_characters_in_utf16_filepath);
-            // Account for the '"' surrounding the filepath.
-            filepath.data++;
-            filepath.count -= 2;
-            ////////////////////////////////////////////////
-        
-            String exe_filepath = get_full_exe_filepath();
-            
-            if(strings_match(&filepath, &exe_filepath))
-            {
-                RegCloseKey(key);
-                return true; // The filepath contained in the key value is correct.
-            }
-            
-            RegDeleteKeyValueW(key, NULL, REGISTRY_KEY_NAME_UTF16); // The filepath contained in the key is out of date. No need to keep it around.
-            RegCloseKey(key);
-            
-            return false;
+static void SetBestDpiAwareness(void) {
+    // Prefer Per-Monitor v2 if available; fall back to system DPI aware.
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (user32) {
+        typedef BOOL (WINAPI *SetProcDpiCtx)(HANDLE);
+        SetProcDpiCtx set_ctx = (SetProcDpiCtx)GetProcAddress(user32, "SetProcessDpiAwarenessContext");
+        // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 == (HANDLE)-4
+        if (set_ctx) {
+            if (set_ctx((HANDLE)-4)) return;
         }
     }
-    
-    RegCloseKey(key);
-    return false;
-}
-
-void set_run_at_startup(b8 run_at_startup)
-{
-    HKEY key = NULL;
-    LSTATUS status = RegCreateKeyExA(HKEY_CURRENT_USER, REGISTRY_KEY_PATH.data, 0, NULL, REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, NULL, &key, NULL);
-    if(status != ERROR_SUCCESS) return;
-    
-    if(run_at_startup)
-    {
-        ////////////////////////////////////////////////////////////////////////////////////////////////////////
-        // NOTE: we surround the filepath with '"' so that spaces in directory names are properly accounted for.
-        ////////////////////////////////////////////////////////////////////////////////////////////////////////
-        
-        String filepath = get_full_exe_filepath();
-        String filepath_string = {.data = tallocate(filepath.count + 2 + 1), .count = filepath.count + 2};
-        stbsp_sprintf(filepath_string.data, "\"%s\"", filepath.data);
-        
-        u16* utf16_filepath = utf8_to_utf16(filepath_string);
-        DWORD filepath_size = 0;
-        u16* c = utf16_filepath;
-        while(*c)
-        {
-            filepath_size += sizeof(u16);
-            c++;
-        }
-        
-        status = RegSetKeyValueW(key, NULL, REGISTRY_KEY_NAME_UTF16, REG_SZ, utf16_filepath, filepath_size + sizeof(u16));
-    }
-    else
-    {
-        status = RegDeleteKeyValueW(key, NULL, REGISTRY_KEY_NAME_UTF16);
-    }
-    
-    RegCloseKey(key);
-}
-
-LRESULT window_message_callback(HWND window, UINT message, WPARAM wparam, LPARAM lparam)
-{
-    if(message == WM_INTERACT_WITH_TRAY_ICON)
-    {
-        int sub_message = LOWORD(lparam);
-        
-        if(sub_message == WM_RBUTTONDOWN || sub_message == WM_LBUTTONDOWN)
-        {
-            // Draw and update menu. START
-            HMENU menu = CreatePopupMenu();
-            
-            const u32 MENU_EXIT                      = 0x01;
-            const u32 MENU_RUN_AT_STARTUP            = 0x02;
-            const u32 MENU_DO_NOT_RUN_AT_STARTUP     = 0x04;
-            const u32 MENU_OPEN_BLACKLIST            = 0x08;
-            const u32 MENU_CREATE_AND_OPEN_BLACKLIST = 0x10;
-            
-            // Get the black list filepath. START
-            String exe_filepath = get_exe_filepath();
-            
-            String blacklist_filepath = {.data = tallocate(exe_filepath.count + LIST_NAME.count + 8)};
-            stbsp_sprintf(blacklist_filepath.data, "%s/%s", exe_filepath.data, LIST_NAME.data);
-            blacklist_filepath.count = strlen(blacklist_filepath.data);
-            
-            u16* utf16_blacklist_filepath = utf8_to_utf16(blacklist_filepath);
-            // Get the black list filepath. END
-            
-            b8 run_at_startup   = do_we_run_at_startup();
-            b8 blacklist_exists = PathFileExistsW(utf16_blacklist_filepath);
-            
-            AppendMenu(menu, MF_STRING | MF_GRAYED, 0, "Process Killer");
-            AppendMenu(menu, MF_SEPARATOR, 0, NULL);
-            
-            if(run_at_startup) AppendMenu(menu, MF_STRING, MENU_DO_NOT_RUN_AT_STARTUP, "Do not run at start-up");
-            else               AppendMenu(menu, MF_STRING, MENU_RUN_AT_STARTUP,        "Run at start-up");
-            
-            if(blacklist_exists) AppendMenu(menu, MF_STRING, MENU_OPEN_BLACKLIST, "Open black list");
-            else                 AppendMenu(menu, MF_STRING, MENU_CREATE_AND_OPEN_BLACKLIST, "Create and open black list");
-            
-            AppendMenu(menu, MF_STRING, MENU_EXIT, "Exit");
-            
-            POINT mouse = {};
-            GetCursorPos(&mouse);
-            
-            SetForegroundWindow(window);
-            u32 menu_item = TrackPopupMenu(menu, TPM_NONOTIFY | TPM_RETURNCMD, mouse.x, mouse.y, 0, window, NULL);
-            if(menu_item == MENU_EXIT)
-            {
-                global_flags &= ~SHOULD_RUN;
-            }
-            else if(menu_item == MENU_RUN_AT_STARTUP)
-            {
-                set_run_at_startup(true);
-            }
-            else if(menu_item == MENU_DO_NOT_RUN_AT_STARTUP)
-            {
-                set_run_at_startup(false);
-            }
-            else if(menu_item == MENU_OPEN_BLACKLIST)
-            {
-                ShellExecuteW(NULL, L"open", utf16_blacklist_filepath, NULL, NULL, SW_SHOWNORMAL);
-            }
-            else if(menu_item == MENU_CREATE_AND_OPEN_BLACKLIST)
-            {
-                void* file = CreateFileW(utf16_blacklist_filepath, 0, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
-                CloseHandle(file);
-                
-                ShellExecuteW(NULL, L"open", utf16_blacklist_filepath, NULL, NULL, SW_SHOWNORMAL);
-            }
-            
-            DestroyMenu(menu);
-            // Draw and update menu. END
-        }
-        
-        return 0;
-    }
-
-    return DefWindowProcA(window, message, wparam, lparam);
-}
-
-int WinMain()
-{
+    // Legacy fallback
     SetProcessDPIAware();
+}
 
-    const u32 MAX_PROCESSES_TO_LIST = 1024;
-    DWORD process_ids[MAX_PROCESSES_TO_LIST];
-    
-    tmp_memory = reallocate(tmp_memory, TMP_MEMORY_SIZE);
-    
-    
-    // Create a window. START
-    const char* WINDOW_TITLE = "Win32 Process Killer";
-    
-    WNDCLASSA window_settings = {
-        .lpfnWndProc   = window_message_callback,
-        .style         = CS_OWNDC,
-        .lpszClassName = "window_settings"
-    };
-    
-    if(FindWindowA(window_settings.lpszClassName, WINDOW_TITLE))
-    { // An instance of this program is already running, no need to run an additional one.
-        return 0;
+static HANDLE g_mutex = NULL;
+static BOOL EnsureSingleInstance(void) {
+    g_mutex = CreateMutexW(NULL, TRUE, L"Global\\Win32ProcessKiller_Mutex");
+    if (!g_mutex) return TRUE; // best effort
+    if (GetLastError() == ERROR_ALREADY_EXISTS) return FALSE;
+    return TRUE;
+}
+
+static void GetExePath(wchar_t* buf, DWORD bufCount) {
+    buf[0] = L'\0';
+    GetModuleFileNameW(NULL, buf, bufCount);
+}
+
+static void GetExeDir(wchar_t* dir, DWORD dirCount) {
+    wchar_t path[MAX_PATH];
+    GetExePath(path, MAX_PATH);
+    StringCchCopyW(dir, dirCount, path);
+    PathRemoveFileSpecW(dir);
+}
+
+static BOOL DirExists(const wchar_t* path) {
+    DWORD attrs = GetFileAttributesW(path);
+    return (attrs != INVALID_FILE_ATTRIBUTES) && (attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static BOOL FileExists(const wchar_t* path) {
+    DWORD attrs = GetFileAttributesW(path);
+    return (attrs != INVALID_FILE_ATTRIBUTES) && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static BOOL EnsureParentDir(const wchar_t* filePath) {
+    wchar_t dir[MAX_PATH];
+    StringCchCopyW(dir, MAX_PATH, filePath);
+    PathRemoveFileSpecW(dir);
+    if (DirExists(dir)) return TRUE;
+    // Create nested directories:
+    return SHCreateDirectoryExW(NULL, dir, NULL) == ERROR_SUCCESS || GetLastError() == ERROR_ALREADY_EXISTS;
+}
+
+static BOOL LaunchAsAdmin(void) {
+    wchar_t exe[MAX_PATH];
+    GetExePath(exe, MAX_PATH);
+    HINSTANCE h = ShellExecuteW(NULL, L"runas", exe, NULL, NULL, SW_SHOWNORMAL);
+    return ((INT_PTR)h > 32);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Blacklist handling
+
+typedef struct Blacklist {
+    wchar_t** items;          // array of normalized patterns (lowercased)
+    size_t    count;
+    FILETIME  lastWriteTime;
+    wchar_t   path[MAX_PATH]; // resolved file path
+} Blacklist;
+
+static void FreeBlacklist(Blacklist* bl) {
+    if (!bl) return;
+    for (size_t i = 0; i < bl->count; ++i) free(bl->items[i]);
+    free(bl->items);
+    bl->items = NULL;
+    bl->count = 0;
+    bl->lastWriteTime.dwLowDateTime = 0;
+    bl->lastWriteTime.dwHighDateTime = 0;
+}
+
+static BOOL HasWildcard(const wchar_t* s) {
+    return (wcspbrk(s, L"*?") != NULL);
+}
+
+static BOOL HasPathSep(const wchar_t* s) {
+    return (wcspbrk(s, L"\\/") != NULL);
+}
+
+static wchar_t* TrimAndDupLower(const wchar_t* start, size_t len) {
+    // Trim whitespace
+    while (len && iswspace(start[0])) { start++; len--; }
+    while (len && iswspace(start[len-1])) { len--; }
+    if (len == 0) return NULL;
+    // Ignore comments
+    if (start[0] == L'#' || start[0] == L';') return NULL;
+
+    wchar_t* out = (wchar_t*)malloc((len + 1) * sizeof(wchar_t));
+    if (!out) return NULL;
+    for (size_t i = 0; i < len; ++i) {
+        wchar_t c = start[i];
+        // Normalize slashes to backslashes for path patterns
+        if (c == L'/') c = L'\\';
+        out[i] = (wchar_t)towlower(c);
     }
-    
-    RegisterClassA(&window_settings);
-    
-    HWND window = CreateWindowA(
-        window_settings.lpszClassName, WINDOW_TITLE, WS_POPUP,
-        CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
-        NULL, NULL, NULL, NULL
-    );
-    if(!window) return 0;
-    // Create a window. END
-    
-    // Create a tray icon. START
-    HICON logo_icon = LoadImageA(GetModuleHandleA(NULL), "LOGO", IMAGE_ICON, 0, 0, LR_DEFAULTSIZE | LR_SHARED);
-    
-    NOTIFYICONDATAA tray_icon = {
-        .cbSize = sizeof(NOTIFYICONDATAA),
-        
-        .hWnd             = window,
-        .hIcon            = logo_icon,
-        .uCallbackMessage = WM_INTERACT_WITH_TRAY_ICON,
-        .uFlags           = NIF_MESSAGE | NIF_ICON | NIF_TIP
-    };
-    
-    strcpy(tray_icon.szTip, "Process Killer");
-    
-    Shell_NotifyIconA(NIM_ADD, &tray_icon);
-    // Create a tray icon. END
-    
-    
-    while(global_flags & SHOULD_RUN)
-    {
-        treset();
-        
-        
-        // Handle events. START
-        MSG message;
-        while(PeekMessageA(&message, window, 0, 0, PM_REMOVE))
-        {
-            TranslateMessage(&message);
-            DispatchMessage(&message);
-        }
-        // Handle events. END
-        
-        
-        maybe_load_blacklist();
-        
-    
-        DWORD result_size;
-        b8 ok = EnumProcesses(process_ids, MAX_PROCESSES_TO_LIST * sizeof(DWORD), &result_size);
-        if(ok)
-        {
-            // Go through processes and take down the ones on the black list. START
-            u32 processes_list_count = result_size / sizeof(DWORD);
-            for(u32 process_index = 0; process_index < processes_list_count; process_index++)
-            {
-                DWORD process_id = process_ids[process_index];
-                
-                HANDLE process = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_TERMINATE, false, process_id);
-                if(process == NULL) continue;
-                
-                const u32 MAX_CHARACTERS_IN_NAME = 512;
-                
-                const u32 UTF16_NAME_MAX_SIZE = MAX_CHARACTERS_IN_NAME * sizeof(u16) * 2;
-                u8 utf16_name[UTF16_NAME_MAX_SIZE];
-                
-                DWORD num_characters_in_name = GetModuleBaseNameW(process, NULL, cast(utf16_name, u16*), UTF16_NAME_MAX_SIZE);
-                if(!num_characters_in_name) goto done_with_this_process;
-                
-                String name = utf16_to_utf8(cast(utf16_name, u16*), num_characters_in_name);
-                
-                // Go through the black list and kill the process if a match is found between this name and one of the black list's. START
-                char* c     = blacklist.data;
-                char* limit = blacklist.data + blacklist.count;
-                
-                String blacklist_name = {.data = c};
-                while(c < limit)
-                {
-                    char character = *c;
-                    if(character == '\n' || character == '\r')
-                    {
-                        if(strings_match(&blacklist_name, &name))
-                        {
-                            TerminateProcess(process, 0);
-                            goto done_with_this_process;
-                        }
-                        
-                        blacklist_name.data  = c + 1;
-                        blacklist_name.count = 0;
-                    }
-                    else blacklist_name.count++;
-                    
-                    c++;
-                }
-                
-                if(strings_match(&blacklist_name, &name)) TerminateProcess(process, 0);
-                // Go through the black list and kill the process if a match is found between this name and one of the black list's. END
-                
-                done_with_this_process:;
-                CloseHandle(process);
+    out[len] = 0;
+    return out;
+}
+
+static BOOL Utf8BytesToWide(const BYTE* bytes, DWORD size, wchar_t** outW) {
+    *outW = NULL;
+    if (size >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF) {
+        bytes += 3; size -= 3; // skip BOM
+    }
+    int chars = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, (LPCSTR)bytes, (int)size, NULL, 0);
+    if (chars <= 0) {
+        // Fallback to ANSI
+        chars = MultiByteToWideChar(CP_ACP, 0, (LPCSTR)bytes, (int)size, NULL, 0);
+        if (chars <= 0) return FALSE;
+        *outW = (wchar_t*)malloc((chars + 1) * sizeof(wchar_t));
+        if (!*outW) return FALSE;
+        MultiByteToWideChar(CP_ACP, 0, (LPCSTR)bytes, (int)size, *outW, chars);
+    } else {
+        *outW = (wchar_t*)malloc((chars + 1) * sizeof(wchar_t));
+        if (!*outW) return FALSE;
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, (LPCSTR)bytes, (int)size, *outW, chars);
+    }
+    (*outW)[chars] = 0;
+    return TRUE;
+}
+
+static void ResolveBlacklistPath(wchar_t out[MAX_PATH]) {
+    // Prefer EXE directory if writable, otherwise LocalAppData\Win32ProcessKiller\blacklist.txt
+    wchar_t exeDir[MAX_PATH];
+    GetExeDir(exeDir, MAX_PATH);
+
+    wchar_t exeSide[MAX_PATH];
+    PathCombineW(exeSide, exeDir, BLACKLIST_NAME);
+
+    // If exists or directory is writable, use next to exe
+    if (FileExists(exeSide)) { StringCchCopyW(out, MAX_PATH, exeSide); return; }
+
+    // Probe writability
+    wchar_t probe[MAX_PATH];
+    PathCombineW(probe, exeDir, L".write_test.tmp");
+    HANDLE h = CreateFileW(probe, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, NULL);
+    if (h != INVALID_HANDLE_VALUE) {
+        CloseHandle(h);
+        StringCchCopyW(out, MAX_PATH, exeSide);
+        return;
+    }
+
+    // LocalAppData fallback
+    PWSTR lad = NULL;
+    if (SUCCEEDED(SHGetKnownFolderPath(&FOLDERID_LocalAppData, KF_FLAG_CREATE, NULL, &lad))) {
+        wchar_t appDir[MAX_PATH];
+        PathCombineW(appDir, lad, L"Win32ProcessKiller");
+        CoTaskMemFree(lad);
+        wchar_t dummy[MAX_PATH];
+        StringCchCopyW(dummy, MAX_PATH, appDir);
+        if (!DirExists(dummy)) SHCreateDirectoryExW(NULL, dummy, NULL);
+        PathCombineW(out, appDir, BLACKLIST_NAME);
+        return;
+    }
+
+    // Last resort: exe directory
+    StringCchCopyW(out, MAX_PATH, exeSide);
+}
+
+static BOOL EnsureBlacklistFileExists(const wchar_t* path) {
+    if (FileExists(path)) return TRUE;
+    if (!EnsureParentDir(path)) return FALSE;
+    HANDLE f = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) return FALSE;
+    static const char kHeader[] =
+        "# Win32 Process Killer blacklist\n"
+        "# One pattern per line. Examples:\n"
+        "#   notepad.exe\n"
+        "#   chrome*.exe\n"
+        "#   C:\\\\Path\\\\to\\\\someapp.exe\n";
+    DWORD written = 0;
+    WriteFile(f, kHeader, (DWORD)sizeof(kHeader) - 1, &written, NULL);
+    CloseHandle(f);
+    return TRUE;
+}
+
+static BOOL TryGetLastWriteTime(const wchar_t* path, FILETIME* out) {
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &fad)) return FALSE;
+    *out = fad.ftLastWriteTime;
+    return TRUE;
+}
+
+static BOOL BlacklistNeedsReload(Blacklist* bl) {
+    FILETIME ft;
+    if (!TryGetLastWriteTime(bl->path, &ft)) return FALSE;
+    return (ft.dwLowDateTime != bl->lastWriteTime.dwLowDateTime ||
+            ft.dwHighDateTime != bl->lastWriteTime.dwHighDateTime);
+}
+
+static BOOL LoadBlacklist(Blacklist* bl) {
+    HANDLE f = CreateFileW(bl->path, GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) return FALSE;
+
+    LARGE_INTEGER size; size.QuadPart = 0;
+    if (!GetFileSizeEx(f, &size) || size.QuadPart > (LONGLONG)(32 * 1024 * 1024)) { CloseHandle(f); return FALSE; }
+
+    BYTE* bytes = (BYTE*)malloc((size_t)size.QuadPart + 1);
+    if (!bytes) { CloseHandle(f); return FALSE; }
+
+    DWORD read = 0;
+    BOOL ok = ReadFile(f, bytes, (DWORD)size.QuadPart, &read, NULL);
+    CloseHandle(f);
+    if (!ok) { free(bytes); return FALSE; }
+    bytes[read] = 0;
+
+    wchar_t* wide = NULL;
+    if (!Utf8BytesToWide(bytes, read, &wide)) { free(bytes); return FALSE; }
+    free(bytes);
+
+    // Parse lines
+    FreeBlacklist(bl);
+
+    // Count lines first (upper bound)
+    size_t cap = 16, cnt = 0;
+    wchar_t** items = (wchar_t**)malloc(cap * sizeof(wchar_t*));
+    if (!items) { free(wide); return FALSE; }
+
+    const wchar_t* s = wide;
+    while (*s) {
+        const wchar_t* line = s;
+        while (*s && *s != L'\n' && *s != L'\r') ++s;
+        size_t len = (size_t)(s - line);
+
+        wchar_t* normalized = TrimAndDupLower(line, len);
+        if (normalized && normalized[0] != 0) {
+            if (cnt == cap) {
+                cap *= 2;
+                wchar_t** ni = (wchar_t**)realloc(items, cap * sizeof(wchar_t*));
+                if (!ni) { free(normalized); break; }
+                items = ni;
             }
-            // Go through processes and take down the ones on the black list. END
+            items[cnt++] = normalized;
         }
-    
-        Sleep(100);
-    }
-    
-    // Remove the tray icon.
-    tray_icon.uFlags = 0;
-    Shell_NotifyIconA(NIM_DELETE, &tray_icon);
-    ////////////////////////
 
+        // consume CRLF
+        if (*s == L'\r') ++s;
+        if (*s == L'\n') ++s;
+    }
+
+    free(wide);
+    bl->items = items;
+    bl->count = cnt;
+
+    // Update timestamp
+    TryGetLastWriteTime(bl->path, &bl->lastWriteTime);
+    return TRUE;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Startup registry (HKCU\...\Run)
+
+static BOOL IsRunAtStartupEnabled(void) {
+    HKEY key;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY_PATH, 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
+        return FALSE;
+
+    wchar_t val[1024] = L"";
+    DWORD type = 0, cb = sizeof(val);
+    LONG r = RegGetValueW(key, NULL, RUN_VALUE_NAME, RRF_RT_REG_SZ, &type, val, &cb);
+    RegCloseKey(key);
+    if (r != ERROR_SUCCESS) return FALSE;
+
+    // Value typically contains quoted full path
+    wchar_t exe[MAX_PATH]; GetExePath(exe, MAX_PATH);
+    // Strip surrounding quotes in registry value if present
+    wchar_t* p = val;
+    size_t n = wcslen(val);
+    if (n >= 2 && val[0] == L'"' && val[n-1] == L'"') { val[n-1] = 0; p = val + 1; }
+    return CompareStringOrdinal(exe, -1, p, -1, TRUE) == CSTR_EQUAL;
+}
+
+static void SetRunAtStartup(BOOL enable) {
+    HKEY key;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, RUN_KEY_PATH, 0, NULL, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, NULL, &key, NULL) != ERROR_SUCCESS)
+        return;
+
+    if (enable) {
+        wchar_t exe[MAX_PATH]; GetExePath(exe, MAX_PATH);
+        wchar_t quoted[MAX_PATH + 2];
+        StringCchPrintfW(quoted, ARRAYSIZE(quoted), L"\"%s\"", exe);
+        RegSetValueExW(key, RUN_VALUE_NAME, 0, REG_SZ, (const BYTE*)quoted, (DWORD)((wcslen(quoted) + 1) * sizeof(wchar_t)));
+    } else {
+        RegDeleteValueW(key, RUN_VALUE_NAME);
+    }
+    RegCloseKey(key);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Tray & window
+
+static NOTIFYICONDATAW g_nid;
+static HWND             g_hwnd = NULL;
+static volatile BOOL    g_running = TRUE;
+static Blacklist        g_blacklist = {0};
+
+static void Tray_Add(void) {
+    ZeroMemory(&g_nid, sizeof(g_nid));
+    g_nid.cbSize = sizeof(NOTIFYICONDATAW);
+    g_nid.hWnd   = g_hwnd;
+    g_nid.uID    = 1;
+    g_nid.uFlags = NIF_MESSAGE | NIF_TIP | NIF_ICON | NIF_GUID;
+    g_nid.uCallbackMessage = TRAY_MSG;
+    g_nid.guidItem = kTrayGuid;
+    StringCchCopyW(g_nid.szTip, ARRAYSIZE(g_nid.szTip), APP_TIP);
+
+    g_nid.hIcon = LoadIconW(NULL, IDI_APPLICATION);
+    Shell_NotifyIconW(NIM_ADD, &g_nid);
+
+    // Opt into v4 behavior
+    g_nid.uVersion = NOTIFYICON_VERSION_4;
+    Shell_NotifyIconW(NIM_SETVERSION, &g_nid);
+}
+
+static void Tray_Delete(void) {
+    if (g_nid.hWnd) {
+        Shell_NotifyIconW(NIM_DELETE, &g_nid);
+        g_nid.hWnd = NULL;
+    }
+}
+
+static void Menu_Show(void) {
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+
+    BOOL runAtStartup = IsRunAtStartupEnabled();
+    BOOL blExists     = FileExists(g_blacklist.path);
+
+    AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, APP_TITLE);
+    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+
+    if (runAtStartup)
+        AppendMenuW(menu, MF_STRING, MENU_ID_STOP_AT_STARTUP, L"Do not run at start-up");
+    else
+        AppendMenuW(menu, MF_STRING, MENU_ID_RUN_AT_STARTUP,  L"Run at start-up");
+
+    if (blExists)
+        AppendMenuW(menu, MF_STRING, MENU_ID_OPEN_BLACKLIST,   L"Open blacklist");
+    else
+        AppendMenuW(menu, MF_STRING, MENU_ID_CREATE_BLACKLIST, L"Create and open blacklist");
+
+    AppendMenuW(menu, MF_STRING, MENU_ID_RELOAD_NOW,   L"Reload now");
+    if (!IsRunningAsAdmin())
+        AppendMenuW(menu, MF_STRING, MENU_ID_RESTART_ADMIN, L"Restart as Administrator");
+    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(menu, MF_STRING, MENU_ID_EXIT, L"Exit");
+
+    POINT pt; GetCursorPos(&pt);
+    SetForegroundWindow(g_hwnd);
+    UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, g_hwnd, NULL);
+    DestroyMenu(menu);
+
+    switch (cmd) {
+        case MENU_ID_EXIT: g_running = FALSE; break;
+        case MENU_ID_RUN_AT_STARTUP:  SetRunAtStartup(TRUE);  break;
+        case MENU_ID_STOP_AT_STARTUP: SetRunAtStartup(FALSE); break;
+
+        case MENU_ID_OPEN_BLACKLIST:
+        case MENU_ID_CREATE_BLACKLIST: {
+            if (cmd == MENU_ID_CREATE_BLACKLIST) EnsureBlacklistFileExists(g_blacklist.path);
+            ShellExecuteW(NULL, L"open", g_blacklist.path, NULL, NULL, SW_SHOWNORMAL);
+        } break;
+
+        case MENU_ID_RELOAD_NOW:
+            g_blacklist.lastWriteTime.dwLowDateTime = 0;
+            g_blacklist.lastWriteTime.dwHighDateTime = 0;
+            break;
+
+        case MENU_ID_RESTART_ADMIN:
+            if (LaunchAsAdmin()) g_running = FALSE;
+            break;
+        default: break;
+    }
+}
+
+static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == TRAY_MSG) {
+        switch (LOWORD(lParam)) {
+            case WM_RBUTTONDOWN:
+            case WM_LBUTTONDOWN:
+            case WM_CONTEXTMENU:
+            case NIN_SELECT:
+            case NIN_KEYSELECT:
+                Menu_Show();
+                return 0;
+        }
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Process enumeration & kill
+
+static BOOL PatternMatches(const wchar_t* patternLower, const wchar_t* fullPathLower, const wchar_t* baseNameLower) {
+    // patternLower is normalized to lowercase with backslashes.
+    if (HasWildcard(patternLower)) {
+        if (HasPathSep(patternLower)) {
+            return PathMatchSpecW(fullPathLower, patternLower);
+        } else {
+            return PathMatchSpecW(baseNameLower, patternLower);
+        }
+    } else {
+        if (HasPathSep(patternLower)) {
+            return CompareStringOrdinal(fullPathLower, -1, patternLower, -1, TRUE) == CSTR_EQUAL;
+        } else {
+            return CompareStringOrdinal(baseNameLower, -1, patternLower, -1, TRUE) == CSTR_EQUAL;
+        }
+    }
+}
+
+static void ToLowerInplace(wchar_t* s) {
+    if (!s) return;
+    CharLowerBuffW(s, (DWORD)wcslen(s));
+}
+
+static void Tick(void) {
+    // refresh blacklist if modified
+    if (BlacklistNeedsReload(&g_blacklist)) {
+        LoadBlacklist(&g_blacklist);
+    }
+
+    DWORD pids[8192];
+    DWORD bytes = 0;
+    if (!EnumProcesses(pids, sizeof(pids), &bytes)) return;
+    DWORD count = bytes / sizeof(DWORD);
+
+    for (DWORD i = 0; i < count && g_running; ++i) {
+        DWORD pid = pids[i];
+        if (pid == 0) continue;
+
+        HANDLE proc = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (!proc) continue;
+
+        wchar_t fullPath[32768]; // QueryFullProcessImageNameW can exceed MAX_PATH on modern Windows
+        DWORD cch = ARRAYSIZE(fullPath);
+        BOOL havePath = QueryFullProcessImageNameW(proc, 0, fullPath, &cch);
+        const wchar_t* base = L"";
+        wchar_t fullLower[32768] = L"";
+        wchar_t baseLower[32768] = L"";
+
+        if (havePath) {
+            base = PathFindFileNameW(fullPath);
+            StringCchCopyW(fullLower, ARRAYSIZE(fullLower), fullPath);
+            ToLowerInplace(fullLower);
+            StringCchCopyW(baseLower, ARRAYSIZE(baseLower), base);
+            ToLowerInplace(baseLower);
+        } else {
+            // Fallback: best-effort base name
+            HMODULE hMod;
+            DWORD needed;
+            if (EnumProcessModules(proc, &hMod, sizeof(hMod), &needed)) {
+                if (GetModuleBaseNameW(proc, hMod, baseLower, ARRAYSIZE(baseLower))) {
+                    StringCchCopyW(fullLower, ARRAYSIZE(fullLower), baseLower);
+                }
+            }
+        }
+
+        BOOL shouldKill = FALSE;
+        for (size_t j = 0; j < g_blacklist.count; ++j) {
+            if (PatternMatches(g_blacklist.items[j],
+                               fullLower[0] ? fullLower : baseLower,
+                               baseLower)) { shouldKill = TRUE; break; }
+        }
+
+        if (shouldKill) {
+            TerminateProcess(proc, 0);
+        }
+
+        CloseHandle(proc);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Entry point
+
+int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nCmdShow) {
+    (void)hPrev; (void)lpCmdLine; (void)nCmdShow;
+
+    if (!EnsureSingleInstance()) return 0;
+    SetBestDpiAwareness();
+
+    // Resolve blacklist location now
+    ResolveBlacklistPath(g_blacklist.path);
+    EnsureBlacklistFileExists(g_blacklist.path);
+    LoadBlacklist(&g_blacklist);
+
+    // Register & create hidden window
+    WNDCLASSW wc = {0};
+    wc.lpfnWndProc   = WndProc;
+    wc.hInstance     = hInst;
+    wc.lpszClassName = APP_WINDOW_CLASS;
+    wc.style         = CS_OWNDC;
+
+    if (!RegisterClassW(&wc)) return 0;
+    g_hwnd = CreateWindowExW(0, APP_WINDOW_CLASS, APP_TITLE, WS_POPUP,
+                             CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+                             NULL, NULL, hInst, NULL);
+    if (!g_hwnd) return 0;
+
+    // Tray icon
+    Tray_Add();
+
+    // Main loop: pump messages and scan
+    const DWORD SLEEP_MS = 250;
+    MSG msg;
+    while (g_running) {
+        while (PeekMessageW(&msg, g_hwnd, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+
+        Tick();
+        Sleep(SLEEP_MS);
+    }
+
+    Tray_Delete();
+    FreeBlacklist(&g_blacklist);
+    if (g_mutex) { CloseHandle(g_mutex); g_mutex = NULL; }
     return 0;
 }
