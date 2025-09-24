@@ -1,16 +1,90 @@
-# Automatic process killer for Windows
-This is a simple utility that automatically kills unwanted processes at any time.
+# Automatic Process Killer for Windows
 
-## How to use it
-Simply run ``pk.exe``. You can access the program through a tray icon. By default the program does not run at startup, you can modify this through the tray menu.
+Fork of [DeliciousLines/automatic-process-killer](https://github.com/DeliciousLines/automatic-process-killer), modernized (Unicode, safer APIs, wildcards, startup toggle, DPI-aware). Tiny, no external deps. Runs in the tray and continuously terminates processes that match your patterns.
 
-To tell the program which processes to kill, make a list of executables names (case-sensitivity matters) by clicking on 'create and open black list' in the tray menu.
-One line in this list corresponds to one process to kill. You can add subsequent modifications to this list through the 'open black list' option in the tray menu. The program automatically reloads the list when it is modified.
+## Features
+- Tray icon with context menu (NOTIFYICON_VERSION_4).
+- Wildcards and full-path matching (e.g., `chrome*.exe`, `C:\Tools\foo.exe`).
+- Case-insensitive match against **base filename** _or_ **full path**.
+- Safe process queries via `QueryFullProcessImageNameW` + `PROCESS_QUERY_LIMITED_INFORMATION`.
+- “Run at start-up” toggle via `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
+- Optional “Restart as Administrator” (for protected processes).
 
-## How to compile it yourself
-Just run your C compiler on ``entry_point.c``. Do not forget to include ``resources.res`` when linking.
+> **Admin note:** Some processes require elevation to terminate. Use **Restart as Administrator** from the tray menu.
 
-MSVC example: ``cl /O2 /TC /D_CRT_SECURE_NO_WARNINGS entry_point.c /Fepk.exe /link resources.res``
+---
+
+## Blacklist file
+- Searched **next to the EXE**: `blacklist.txt`. If not writable, falls back to  
+  `%LOCALAPPDATA%\Win32ProcessKiller\blacklist.txt` (auto-created).
+- Encoding: UTF-8 (BOM or not) or ANSI. One **pattern** per line. Lines starting with `#` or `;` are comments.
+- Wildcards follow Windows rules: `*` and `?`.
+- If a pattern contains a path separator (`\` or `/`), it’s matched against the **full path**; otherwise against the **base name**.
+
+**Examples**
+```
+
+# Base name
+
+notepad.exe
+chrome\*.exe
+
+# Full path (normalize to backslashes recommended)
+
+C:\Program Files\SomeApp\app.exe
+D:\Tools\*\helper?.exe
+
+```
+
+The file is auto-reloaded when modified; you can also **Reload now** from the tray.
+
+---
+
+## Usage
+1. Run `pk.exe`. The tray icon appears.
+2. Right-click:
+   - **Open blacklist** / **Create and open blacklist**
+   - **Run at start-up** / **Do not run at start-up**
+   - **Reload now**
+   - **Restart as Administrator**
+   - **Exit**
+
+---
+
+## Build (MSVC, no resources required)
+Using the “Developer Command Prompt for VS”:
+
+```powershell
+# Release (GUI subsystem)
+cl /nologo /O2 /W4 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN entry_point.c /link /SUBSYSTEM:WINDOWS
+
+# Debug (console for logs & easy Ctrl+C close)
+cl /nologo /Od /Z7 /W4 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN entry_point.c
+
+# x64 explicit
+cl /nologo /O2 /W4 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /favor:INTEL64 entry_point.c /link /SUBSYSTEM:WINDOWS
+```
+
+> You can add your own icon via a `.rc` file if desired; this build uses the default application icon.
+
+---
+
+## FAQ / Notes
+
+* **Does the match include path?**
+  Yes if your pattern contains `\` or `/`; otherwise it matches only the base filename (both are case-insensitive).
+* **Why didn’t a process terminate?**
+  It may require elevation, its image path wasn’t readable, or the pattern didn’t match. Try **Restart as Administrator** and confirm the pattern (use full path).
+* **Where’s the config?**
+  Only `blacklist.txt`. Startup is toggled via the tray (writes to HKCU **Run**).
+* **Uninstall?**
+  Disable **Run at start-up**, exit the app, then delete the EXE and (optionally)
+  `%LOCALAPPDATA%\Win32ProcessKiller\blacklist.txt`.
+
+---
 
 ## License
-This code is placed under the MIT license. You can check the license details in ``entry_point.c``. This code makes use of STB sprintf (https://github.com/nothings/stb/blob/master/stb_sprintf.h) which is also placed under the MIT license.
+
+MIT (see header in `entry_point.c`).
+This fork does **not** require `stb_sprintf`; the stub remains for compatibility and can be removed.
+
